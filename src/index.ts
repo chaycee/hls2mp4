@@ -1,6 +1,10 @@
 import Transmuxer from './muxer/mp4-transmuxer'
-import aesjs, { type ByteSource } from 'aes-js'
-import { fetchFile } from './util/http'
+import aesjs,  {ByteSource} from 'aes-js'
+import {fetchFile} from './util/http'
+import {isPlaylistM3U8} from "./util/isPlaylistM3U8";
+import {isNullOrWhitespace} from "./util/isNullOrWhitespace";
+import {StringBuilder} from "./util/stringBuilder";
+import * as http from "http";
 
 enum TaskType {
     parseM3u8 = 0,
@@ -124,6 +128,10 @@ class Hls2Mp4 {
     }
 
     public static async parseM3u8File(url: string, customFetch?: (url: string) => Promise<string>): Promise<M3u8Parsed> {
+        const uri = new URL(url);
+        const baseUrl = `${uri.protocol}://${uri.host}`;
+        const lastIndexSlash = url.lastIndexOf('/');
+        const resolutionRegex = /RESOLUTION=\d+x(\d+)/;
         let playList = '';
         if (customFetch) {
             playList = await customFetch(url)
@@ -133,12 +141,48 @@ class Hls2Mp4 {
                 data => aesjs.utils.utf8.fromBytes(data)
             )
         }
-        const matchedM3u8 = playList.match(
-            createFileUrlRegExp('m3u8', 'i')
-        )
-        if (matchedM3u8) {
-            const parsedUrl = parseUrl(url, matchedM3u8[0])
-            return this.parseM3u8File(parsedUrl, customFetch)
+        const lines: string[] = playList.split('\n');
+        const isPlaylist = isPlaylistM3U8(lines);
+        const newLineBuilder = new StringBuilder();
+        if (isPlaylist) {
+            const playListUrls: { url: string, resolution: number | null }[] = []
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (!line.startsWith("http") && !line.startsWith('#') && !isNullOrWhitespace(line)) {
+                    newLineBuilder.clear();
+                    if (line.startsWith("//")) {
+                        newLineBuilder.append("https:" + line)
+                    } else if (line.startsWith("/")) {
+                        newLineBuilder.append(baseUrl);
+                        newLineBuilder.append(line);
+                    } else {
+                        const slicedUrl = url.slice(0, lastIndexSlash + 1);
+                        newLineBuilder.append(slicedUrl);
+                        newLineBuilder.append(line);
+                    }
+                    const match = lines[i - 1].match(resolutionRegex)?.at(1);
+                    const lastNumber = match ? parseInt(match) : null;
+                    playListUrls.push({
+                        url: newLineBuilder.toString(),
+                        resolution: lastNumber
+                    });
+                }else if(line.startsWith("http")){
+                    const match = lines[i - 1].match(resolutionRegex)?.at(1);
+                    const lastNumber = match ? parseInt(match) : null;
+                    playListUrls.push({
+                        url: lines[i],
+                        resolution: lastNumber
+                    });
+                }
+            }
+            const nonNullItems = playListUrls.filter(item => item.resolution !== null);
+            let highQualityUrl = playListUrls[0].url
+            if (nonNullItems.length > 0) {
+                highQualityUrl = nonNullItems.reduce((maxItem, currentItem) => {
+                    return currentItem.resolution! > maxItem.resolution! ? currentItem : maxItem;
+                }, nonNullItems[0]).url;
+            }
+            return this.parseM3u8File(highQualityUrl, customFetch)
         }
         return {
             url,
@@ -195,29 +239,38 @@ class Hls2Mp4 {
     }
 
     private async downloadM3u8(url: string) {
+
         const m3u8Parsed = await this.parseM3u8(url)
         let { content, url: parsedUrl } = m3u8Parsed!;
-        const keyMatchRegExp = createFileUrlRegExp('key', 'gi');
-        const keyTagMatchRegExp = new RegExp(
-            '#EXT-X-KEY:METHOD=(AES-128|NONE)(,URI="' + keyMatchRegExp.source + '"(,IV=\\w+)?)?',
-            'gi'
-        )
-        const matchReg = new RegExp(
-            keyTagMatchRegExp.source + '|' + createFileUrlRegExp('ts', 'gi').source,
-            'g'
-        )
-        const matches = content.match(matchReg)
-        if (!matches) {
+        const URIRegex = new RegExp(`URI=""([^""]+)""`)
+
+        const urls = this.getUrls(url,content);
+        if (!urls) {
             throw new Error('Invalid m3u8 file, no ts file found')
         }
-
         this.duration = this.computeTotalDuration(content)
 
         const segments: SegmentGroup[] = []
-        for (let i = 0; i < matches.length; i++) {
-            const matched = matches[i]
+        for (let i = 0; i < urls.length; i++) {
+            const uri = new URL(url);
+            const baseUrl = `${uri.protocol}://${uri.host}`;
+            const lastIndexSlash = url.lastIndexOf('/');
+            const matched = urls[i].url
+            let matchedKey:string|undefined;
             if (matched.match(/#EXT-X-KEY/)) {
-                const matchedKey = matched.match(keyMatchRegExp)?.[0]
+                const matchedUrl = matched.match(URIRegex)?.at(1);
+                if(matchedUrl){
+                    if(matchedUrl.startsWith("//")){
+                        matchedKey = "https:"+matchedUrl;
+                    }else if(matchedUrl.startsWith("/")){
+                        matchedKey = baseUrl+matchedUrl;
+                    }else if(matchedUrl.startsWith("http")){
+                        matchedKey = matchedUrl;
+                    }else{
+                        const slicedUrl = url.slice(0, lastIndexSlash + 1);
+                        matchedKey = slicedUrl+matchedUrl;
+                    }
+                }
                 const matchedIV = matched.match(/IV=\w+$/)?.[0]?.replace(/^IV=/, '')
                 segments.push({
                     key: matchedKey,
@@ -244,22 +297,18 @@ class Hls2Mp4 {
             let keyBuffer: Uint8Array | undefined;
 
             if (group.key) {
-                const keyUrl = parseUrl(parsedUrl, group.key)
-                keyBuffer = await this.downloadFile(keyUrl)
+                keyBuffer = await this.downloadFile(group.key)
             }
-
             for (let i = 0; i <= Math.floor((total / batch)); i++) {
-
                 await this.downloadSegments(
                     group.segments.slice(
                         i * batch,
                         Math.min(total, (i + 1) * batch)
                     ).map<Segment>(
                         (seg, j) => {
-                            const url = parseUrl(parsedUrl, seg)
                             return {
                                 index: treatedSegments + i * batch + j,
-                                url
+                                url:seg
                             }
                         }
                     ),
@@ -269,6 +318,48 @@ class Hls2Mp4 {
             }
             treatedSegments += total;
         }
+    }
+
+    private getUrls(url: string, content: string) {
+        const uri = new URL(url);
+        const baseUrl = `${uri.protocol}://${uri.host}`;
+        const lastIndexSlash = url.lastIndexOf('/');
+        const lines: string[] = content.split('\n');
+        const newLineBuilder = new StringBuilder();
+        const finalUrls: { url: string, type: "ts" | "encryption" | null }[] = []
+        for (let i = 0; i < lines.length; i++) {
+
+            const line = lines[i];
+            if (line.startsWith("#EXT-X-KEY")) {
+                finalUrls.push({
+                    url: line,
+                    type: 'encryption'
+                });
+            }
+            if (!line.startsWith("http") && !line.startsWith('#') && !isNullOrWhitespace(line)) {
+                newLineBuilder.clear();
+                if (line.startsWith("//")) {
+                    newLineBuilder.append("https:" + line)
+                } else if (line.startsWith("/")) {
+                    newLineBuilder.append(baseUrl);
+                    newLineBuilder.append(line);
+                } else {
+                    const slicedUrl = url.slice(0, lastIndexSlash + 1);
+                    newLineBuilder.append(slicedUrl);
+                    newLineBuilder.append(line);
+                }
+                finalUrls.push({
+                    url: newLineBuilder.toString(),
+                    type: "ts"
+                })
+            }else if (line.startsWith("http")){
+                finalUrls.push({
+                    url: line,
+                    type: "ts"
+                })
+            }
+        }
+        return finalUrls;
     }
 
     private async loopLoadFile<T = undefined>(startLoad: () => PromiseLike<T | undefined>): Promise<LoadResult<T>> {
